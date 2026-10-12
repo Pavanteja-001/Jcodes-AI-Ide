@@ -380,12 +380,26 @@ export const displayInfoOfFeatureName = (featureName: FeatureName) => {
 }
 
 
+// cloud providers where we can actually call the provider's list-models endpoint to verify the API key works
+export const keyVerifiableProviderNames = ['openAI', 'deepseek', 'groq', 'xAI', 'mistral', 'openRouter', 'gemini'] satisfies ProviderName[]
+
 // the models of these can be refreshed (in theory all can, but not all should)
-export const refreshableProviderNames = localProviderNames
+export const refreshableProviderNames = [...localProviderNames, ...keyVerifiableProviderNames] satisfies ProviderName[]
 export type RefreshableProviderName = typeof refreshableProviderNames[number]
 
 // models that come with download buttons
 export const hasDownloadButtonsOnModelsProviderNames = ['ollama'] as const satisfies ProviderName[]
+
+// known API key prefixes, for catching obviously-wrong keys (e.g. "123", "xyz") before even trying to verify them - providers without a known fixed prefix are omitted, not every provider's key format is public/stable
+export const apiKeyFormatOfProvider: Partial<Record<ProviderName, RegExp>> = {
+	anthropic: /^sk-ant-/,
+	openAI: /^sk-/,
+	deepseek: /^sk-/,
+	groq: /^gsk_/,
+	xAI: /^xai-/,
+	openRouter: /^sk-or-/,
+	// gemini keys usually start with "AIza" but Google doesn't document this as a stable guarantee, so we don't hard-block on it (better to let a stray malformed key through than reject a real one)
+}
 
 
 

@@ -42,6 +42,20 @@ import {
 import { readProjectBrainIndex, writeProjectBrainIndex } from './projectBrainPersistence.js';
 
 const INCREMENTAL_UPDATE_DEBOUNCE_MS = 1500
+// disk writes are batched separately from in-memory updates so a burst of saves (e.g. a
+// find-and-replace across many files) doesn't serialize+write the whole index once per file
+const INDEX_WRITE_DEBOUNCE_MS = 5000
+// per-file cap on how much text is inlined into the Ask Brain prompt, so a handful of large
+// matched files can't blow out the context window
+const ASK_BRAIN_EXCERPT_CHARS = 4000
+// generic words that shouldn't count as filename-matching signal (e.g. "explain the architecture"
+// should match on "architecture", not dilute/misfire on "explain"/"the")
+const ASK_BRAIN_STOPWORDS = new Set([
+	'the', 'and', 'for', 'are', 'was', 'were', 'has', 'have', 'had', 'does', 'did', 'doing',
+	'what', 'when', 'where', 'why', 'how', 'who', 'which', 'this', 'that', 'these', 'those',
+	'explain', 'describe', 'show', 'tell', 'give', 'find', 'list', 'summarize', 'overview',
+	'project', 'code', 'codebase', 'about', 'with', 'from', 'into', 'work', 'works', 'file', 'files',
+])
 const SCAN_PHASE_ORDER: ScanPhaseId[] = [
 	'detect-project-type', 'read-package-config', 'map-directories', 'classify-files', 'find-entry-points',
 	'map-dependencies', 'detect-architecture', 'build-relationships', 'analyze-git-history', 'generate-insights',
@@ -80,7 +94,7 @@ export interface IProjectBrainService {
 	getWhatChanged(): WhatChangedResult | null
 	getContextSummary(userQuery: string): string | null
 	search(query: string): ProjectBrainSearchResults
-	askBrain(question: string, handlers: AskBrainHandlers): string | null
+	askBrain(question: string, handlers: AskBrainHandlers): Promise<string | null>
 	abortAsk(requestId: string): void
 	// cross-command -> React signal used by commands like "Show Architecture" to tell an
 	// already-mounted (or about-to-mount) dashboard which tab to land on
@@ -104,6 +118,7 @@ class ProjectBrainService extends Disposable implements IProjectBrainService {
 
 	private readonly _scmProxy: IVoidSCMService
 	private _scanPromise: Promise<void> | null = null
+	private _writeDelayer: Delayer<void> | null = null
 
 	constructor(
 		@IFileService private readonly fileService: IFileService,
@@ -236,14 +251,19 @@ class ProjectBrainService extends Disposable implements IProjectBrainService {
 		}
 	}
 
-	askBrain(question: string, handlers: AskBrainHandlers): string | null {
+	async askBrain(question: string, handlers: AskBrainHandlers): Promise<string | null> {
 		const index = this._state.index
 		if (!index) { handlers.onError('Project Brain has not been built yet.'); return null }
 
+		const rootURI = this._workspaceRootURI()
 		const relevantFiles = this._matchRelevantFiles(question, 10)
 		const references: AskBrainReference[] = relevantFiles.map(f => ({ relPath: f.relPath, reason: `classified as ${FILE_CATEGORY_LABELS[f.category]}` }))
+		const fileExcerpts = rootURI ? await this._readFileExcerpts(rootURI, relevantFiles) : []
 		const contextBlock = this.getContextSummary(question) ?? ''
-		const systemMessage = `You are Project Brain, J code's built-in project-understanding assistant. Answer the developer's question about THIS project using only the indexed context below - do not invent files or facts that aren't listed. Be concise and concrete. When you reference a file, use its exact relative path.\n\n${contextBlock}`
+		const excerptsBlock = fileExcerpts.length
+			? '\n\n' + fileExcerpts.map(e => `--- ${e.relPath} ---\n${e.text}`).join('\n\n')
+			: ''
+		const systemMessage = `You are Project Brain, J code's built-in project-understanding assistant. Answer the developer's question about THIS project using only the indexed context and file excerpts below - do not invent files or facts that aren't listed. Be concise and concrete. When you reference a file, use its exact relative path.\n\n${contextBlock}${excerptsBlock}`
 
 		const featureName: FeatureName = 'Chat'
 		const modelSelection = this.voidSettingsService.state.modelSelectionOfFeature[featureName]
@@ -294,6 +314,19 @@ class ProjectBrainService extends Disposable implements IProjectBrainService {
 	private _setState(partial: Partial<ProjectBrainState>): void {
 		this._state = { ...this._state, ...partial }
 		this._onDidChangeState.fire()
+	}
+
+	// coalesces disk writes so a burst of index mutations (many incremental updates, or an
+	// incremental update following close behind a full scan) results in one write, not one per mutation
+	private _scheduleIndexWrite(rootURI: URI, index: ProjectBrainIndex): void {
+		if (!this._writeDelayer) this._writeDelayer = this._register(new Delayer<void>(INDEX_WRITE_DEBOUNCE_MS))
+		this._writeDelayer.trigger(async () => {
+			try {
+				await writeProjectBrainIndex(this.fileService, rootURI, index)
+			} catch (e) {
+				console.error('[Project Brain] Failed to persist index:', e)
+			}
+		})
 	}
 
 	private _markActive(id: ScanPhaseId): void {
@@ -621,22 +654,51 @@ class ProjectBrainService extends Disposable implements IProjectBrainService {
 		return name.replace(/\.(test|spec)\.[jt]sx?$/i, '').replace(/\.[^.]+$/, '')
 	}
 
+	private async _readFileExcerpts(rootURI: URI, files: ScannedFile[]): Promise<{ relPath: string, text: string }[]> {
+		const results = await Promise.all(files.map(async (f) => {
+			try {
+				const content = await this.fileService.readFile(toUri(rootURI, f.relPath))
+				if (content.value.byteLength > MAX_TEXT_SCAN_BYTES) return null
+				const text = content.value.toString().slice(0, ASK_BRAIN_EXCERPT_CHARS)
+				return { relPath: f.relPath, text }
+			} catch {
+				return null
+			}
+		}))
+		return results.filter((r): r is { relPath: string, text: string } => r !== null)
+	}
+
 	private _matchRelevantFiles(query: string, limit: number): ScannedFile[] {
 		const index = this._state.index
 		if (!index) return []
-		const keywords = query.toLowerCase().split(/\W+/).filter(w => w.length > 2)
-		if (keywords.length === 0) return []
-		const scored = index.files.map(f => {
+		const keywords = query.toLowerCase().split(/\W+/)
+			.filter(w => w.length > 2 && !ASK_BRAIN_STOPWORDS.has(w))
+		const scored = keywords.length ? index.files.map(f => {
 			const lower = f.relPath.toLowerCase()
+			const categoryLabel = FILE_CATEGORY_LABELS[f.category].toLowerCase()
 			let score = 0
 			for (const kw of keywords) {
 				if (lower.includes(kw)) score += 2
-				if (f.category === kw) score += 1
+				if (f.category === kw || categoryLabel.includes(kw)) score += 1
 			}
 			return { f, score }
-		}).filter(x => x.score > 0)
+		}).filter(x => x.score > 0) : []
 		scored.sort((a, b) => b.score - a.score)
-		return scored.slice(0, limit).map(x => x.f)
+		const matched = scored.slice(0, limit).map(x => x.f)
+
+		// broad/generic questions (or queries whose keywords don't hit any filename) don't score
+		// any files above - fall back to a representative slice of the project (entry points, docs,
+		// one file per structural category) so the model still gets real content instead of nothing
+		if (matched.length < limit) {
+			const seen = new Set(matched.map(f => f.relPath))
+			const priorityCategories: FileCategory[] = ['entry', 'doc', 'api', 'service', 'model', 'auth', 'component', 'config']
+			for (const category of priorityCategories) {
+				if (matched.length >= limit) break
+				const candidate = index.files.find(f => f.category === category && !seen.has(f.relPath))
+				if (candidate) { matched.push(candidate); seen.add(candidate.relPath) }
+			}
+		}
+		return matched.slice(0, limit)
 	}
 
 	// ---------- incremental updates ----------
@@ -677,32 +739,51 @@ class ProjectBrainService extends Disposable implements IProjectBrainService {
 		const index = this._state.index
 		if (!index) return
 
-		for (const relPath of changedRelPaths) {
-			const uri = toUri(rootURI, relPath)
-			const exists = await this.fileService.exists(uri)
+		type FileUpdate =
+			| { kind: 'removed', relPath: string }
+			| { kind: 'skip' }
+			| { kind: 'upserted', relPath: string, ext: string, category: FileCategory, imports: string[], issues: IssueEntry[] }
 
-			if (!exists) {
-				index.files = index.files.filter(f => f.relPath !== relPath)
-				index.issues = index.issues.filter(i => i.relPath !== relPath)
+		// resolve/read all changed files concurrently (same chunking as the full scan) instead of
+		// one-at-a-time, then apply results to the index sequentially so mutation stays race-free
+		const CHUNK_SIZE = 25
+		const updates: FileUpdate[] = []
+		for (let i = 0; i < changedRelPaths.length; i += CHUNK_SIZE) {
+			const chunk = changedRelPaths.slice(i, i + CHUNK_SIZE)
+			const chunkResults = await Promise.all(chunk.map(async (relPath): Promise<FileUpdate> => {
+				const uri = toUri(rootURI, relPath)
+				const exists = await this.fileService.exists(uri)
+				if (!exists) return { kind: 'removed', relPath }
+
+				const stat = await this.fileService.resolve(uri, { resolveMetadata: false }).catch(() => null)
+				if (!stat || stat.isDirectory) return { kind: 'skip' } // directory-level changes need a real rescan (Refresh Project Brain)
+
+				const ext = relPath.includes('.') ? relPath.slice(relPath.lastIndexOf('.')) : ''
+				const category = classifyFile(relPath)
+				let issues: IssueEntry[] = []
+				try {
+					const content = await this.fileService.readFile(uri)
+					if (content.value.byteLength <= MAX_TEXT_SCAN_BYTES) {
+						issues = scanTextForIssues(relPath, content.value.toString())
+					}
+				} catch { /* unreadable - leave without issues */ }
+				return { kind: 'upserted', relPath, ext, category, imports: [], issues }
+			}))
+			updates.push(...chunkResults)
+		}
+
+		for (const update of updates) {
+			if (update.kind === 'skip') continue
+			if (update.kind === 'removed') {
+				index.files = index.files.filter(f => f.relPath !== update.relPath)
+				index.issues = index.issues.filter(i => i.relPath !== update.relPath)
 				continue
 			}
-
-			const stat = await this.fileService.resolve(uri, { resolveMetadata: false }).catch(() => null)
-			if (!stat || stat.isDirectory) continue // directory-level changes need a real rescan (Refresh Project Brain)
-
-			const ext = relPath.includes('.') ? relPath.slice(relPath.lastIndexOf('.')) : ''
-			const category = classifyFile(relPath)
-			let file = index.files.find(f => f.relPath === relPath)
-			if (!file) { file = { relPath, ext, category, imports: [] }; index.files.push(file) }
-			else { file.category = category }
-
-			index.issues = index.issues.filter(i => i.relPath !== relPath)
-			try {
-				const content = await this.fileService.readFile(uri)
-				if (content.value.byteLength <= MAX_TEXT_SCAN_BYTES) {
-					index.issues.push(...scanTextForIssues(relPath, content.value.toString()))
-				}
-			} catch { /* unreadable - leave without issues */ }
+			let file = index.files.find(f => f.relPath === update.relPath)
+			if (!file) { file = { relPath: update.relPath, ext: update.ext, category: update.category, imports: update.imports }; index.files.push(file) }
+			else { file.category = update.category }
+			index.issues = index.issues.filter(i => i.relPath !== update.relPath)
+			index.issues.push(...update.issues)
 		}
 
 		index.meta.filesIndexed = index.files.length
@@ -715,7 +796,7 @@ class ProjectBrainService extends Disposable implements IProjectBrainService {
 		})
 
 		this._setState({ index: { ...index } })
-		await writeProjectBrainIndex(this.fileService, rootURI, index)
+		this._scheduleIndexWrite(rootURI, index)
 	}
 }
 

@@ -9,7 +9,7 @@ import { Tool as GeminiTool, FunctionDeclaration, GoogleGenAI, ThinkingConfig, S
 import { GoogleAuth } from 'google-auth-library'
 /* eslint-enable */
 
-import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
+import { AnthropicLLMChatMessage, GeminiLLMChatMessage, GeminiModelResponse, LLMChatMessage, LLMFIMMessage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
 import { LLMUsage } from '../../common/tokenUsageTypes.js';
 import { ChatMode, displayInfoOfProviderName, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
 import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace } from '../../common/modelCapabilities.js';
@@ -855,6 +855,28 @@ const sendGeminiChat = async ({
 		})
 };
 
+const _geminiList = async ({ onSuccess: onSuccess_, onError: onError_, settingsOfProvider }: ListParams_Internal<GeminiModelResponse>) => {
+	const onSuccess = ({ models }: { models: GeminiModelResponse[] }) => {
+		onSuccess_({ models })
+	}
+	const onError = ({ error }: { error: string }) => {
+		onError_({ error })
+	}
+	try {
+		const thisConfig = settingsOfProvider.gemini
+		const genAI = new GoogleGenAI({ apiKey: thisConfig.apiKey });
+		const models: GeminiModelResponse[] = []
+		const pager = await genAI.models.list()
+		for await (const model of pager) {
+			if (model.name) models.push({ name: model.name })
+		}
+		onSuccess({ models })
+	}
+	catch (error) {
+		onError({ error: error + '' })
+	}
+}
+
 
 
 type CallFnOfProvider = {
@@ -874,22 +896,22 @@ export const sendLLMMessageToProviderImplementation = {
 	openAI: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
 		sendFIM: null,
-		list: null,
+		list: (params) => _openaiCompatibleList(params),
 	},
 	xAI: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
 		sendFIM: null,
-		list: null,
+		list: (params) => _openaiCompatibleList(params),
 	},
 	gemini: {
 		sendChat: (params) => sendGeminiChat(params),
 		sendFIM: null,
-		list: null,
+		list: (params) => _geminiList(params),
 	},
 	mistral: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
 		sendFIM: (params) => sendMistralFIM(params),
-		list: null,
+		list: (params) => _openaiCompatibleList(params),
 	},
 	ollama: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
@@ -904,7 +926,7 @@ export const sendLLMMessageToProviderImplementation = {
 	openRouter: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
 		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
-		list: null,
+		list: (params) => _openaiCompatibleList(params),
 	},
 	vLLM: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
@@ -914,12 +936,12 @@ export const sendLLMMessageToProviderImplementation = {
 	deepseek: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
 		sendFIM: null,
-		list: null,
+		list: (params) => _openaiCompatibleList(params),
 	},
 	groq: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
 		sendFIM: null,
-		list: null,
+		list: (params) => _openaiCompatibleList(params),
 	},
 
 	lmStudio: {

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react'; // Added useRef import just in case it was missed, though likely already present
-import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName } from '../../../../common/voidSettingsTypes.js'
+import { ProviderName, SettingName, displayInfoOfSettingName, providerNames, VoidStatefulModelInfo, customSettingNamesOfProvider, RefreshableProviderName, refreshableProviderNames, displayInfoOfProviderName, nonlocalProviderNames, localProviderNames, GlobalSettingName, featureNames, displayInfoOfFeatureName, isProviderNameDisabled, FeatureName, hasDownloadButtonsOnModelsProviderNames, subTextMdOfProviderName, apiKeyFormatOfProvider, keyVerifiableProviderNames } from '../../../../common/voidSettingsTypes.js'
 import ErrorBoundary from '../sidebar-tsx/ErrorBoundary.js'
 import { VoidButtonBgDarken, VoidCustomDropdownBox, VoidInputBox2, VoidSimpleInputBox, VoidSwitch } from '../util/inputs.js'
 import { useAccessor, useIsDark, useIsOptedOut, useRefreshModelListener, useRefreshModelState, useSettingsState } from '../util/services.js'
@@ -18,16 +18,6 @@ import { MCPServer } from '../../../../common/mcpServiceTypes.js';
 import { useMCPServiceState } from '../util/services.js';
 import { OPT_OUT_KEY } from '../../../../common/storageKeys.js';
 import { StorageScope, StorageTarget } from '../../../../../../../platform/storage/common/storage.js';
-
-type Tab =
-	| 'models'
-	| 'localProviders'
-	| 'providers'
-	| 'featureOptions'
-	| 'mcp'
-	| 'general'
-	| 'all';
-
 
 const ButtonLeftTextRightOption = ({ text, leftButton }: { text: string, leftButton?: React.ReactNode }) => {
 
@@ -461,9 +451,9 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 				`}
 			>
 				{/* left part is width:full */}
-				<div className={`flex flex-grow items-center gap-4`}>
-					<span className='w-full max-w-32'>{isNewProviderName ? providerTitle : ''}</span>
-					<span className='w-fit max-w-[400px] truncate'>{modelName}</span>
+				<div className={`flex flex-grow items-center gap-3 min-w-0`}>
+					<span className='w-32 shrink-0 truncate text-void-fg-3 text-xs'>{isNewProviderName ? providerTitle : ''}</span>
+					<span className='min-w-0 truncate'>{modelName}</span>
 				</div>
 
 				{/* right part is anything that fits */}
@@ -623,16 +613,23 @@ const ProviderSetting = ({ providerName, settingName, subTextMd }: { providerNam
 
 	// Create a stable callback reference using useCallback with proper dependencies
 	const handleChangeValue = useCallback((newVal: string) => {
-		voidSettingsService.setSettingOfProvider(providerName, settingName, newVal)
+		// strip whitespace/newlines that often sneak in from copy-pasting a key (e.g. trailing newline), which would otherwise make a real key look invalid or fail the provider's own check
+		const cleanedVal = settingName === 'apiKey' ? newVal.trim() : newVal
+		voidSettingsService.setSettingOfProvider(providerName, settingName, cleanedVal)
 	}, [voidSettingsService, providerName, settingName]);
 
+	// catch obviously-wrong keys (e.g. "123", "xyz") immediately, before waiting on any network verification
+	const expectedFormat = settingName === 'apiKey' ? apiKeyFormatOfProvider[providerName] : undefined
+	const looksLikeWrongFormat = !!expectedFormat && settingValue.length > 0 && !expectedFormat.test(settingValue)
+
 	return <ErrorBoundary>
-		<div className='my-1'>
+		<div className='my-3'>
+			<label className='block text-xs font-medium text-void-fg-3 mb-1 px-0.5'>{settingTitle}</label>
 			<div className='relative'>
 				<VoidSimpleInputBox
 					value={settingValue}
 					onChangeValue={handleChangeValue}
-					placeholder={`${settingTitle} (${placeholder})`}
+					placeholder={placeholder}
 					passwordBlur={isPasswordField && !isRevealed}
 					compact={true}
 					className={isPasswordField ? 'pr-8' : ''}
@@ -650,6 +647,11 @@ const ProviderSetting = ({ providerName, settingName, subTextMd }: { providerNam
 					</button>
 				)}
 			</div>
+			{looksLikeWrongFormat && (
+				<div className='py-1 px-3 text-sm text-red-400'>
+					This doesn't look like a valid {displayInfoOfProviderName(providerName).title} API key.
+				</div>
+			)}
 			{!subTextMd ? null : <div className='py-1 px-3 opacity-50 text-sm'>
 				{subTextMd}
 			</div>}
@@ -776,9 +778,92 @@ const ActiveModelIndicator = () => {
 }
 
 
+// shows whether the entered API key was actually verified against the provider, for providers we can auto-verify,
+// and lets the user manually trigger a verification instead of waiting for one to fire off a settings edit
+const ApiKeyValidator = ({ providerName }: { providerName: ProviderName }) => {
+	const accessor = useAccessor()
+	const refreshModelService = accessor.get('IRefreshModelService')
+	const metricsService = accessor.get('IMetricsService')
+
+	const refreshModelState = useRefreshModelState();
+	const settingsState = useSettingsState();
+
+	// the underlying check is a real network request to the provider's list-models endpoint with no
+	// built-in timeout, so a slow/unreachable network can leave it "Verifying..." indefinitely - warn the user instead of just spinning forever
+	const [isSlow, setIsSlow] = useState(false)
+	const slowTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+	const apiKey = (settingsState.settingsOfProvider[providerName] as { apiKey?: string }).apiKey;
+	const expectedFormat = apiKeyFormatOfProvider[providerName];
+
+	const isVerifiable = (keyVerifiableProviderNames as string[]).includes(providerName)
+	const looksWrongFormat = !!apiKey && !!expectedFormat && !expectedFormat.test(apiKey)
+	const state = isVerifiable ? refreshModelState[providerName as RefreshableProviderName].state : undefined
+
+	useEffect(() => {
+		if (state !== 'refreshing') {
+			setIsSlow(false)
+			if (slowTimeoutRef.current) clearTimeout(slowTimeoutRef.current)
+			return
+		}
+		slowTimeoutRef.current = setTimeout(() => setIsSlow(true), 8000)
+		return () => { if (slowTimeoutRef.current) clearTimeout(slowTimeoutRef.current) }
+	}, [state])
+
+	let content: React.ReactNode
+	if (looksWrongFormat) {
+		content = <span className="flex items-center gap-1.5 text-xs px-2 py-1 rounded-full bg-red-950 text-red-400">Key doesn't look valid</span>
+	}
+	else if (!isVerifiable) {
+		content = <span className="text-xs px-2 py-1 rounded-full bg-void-bg-2 text-void-fg-3">Verification not available for this provider</span>
+	}
+	else if (!apiKey) {
+		content = <span className="text-xs px-2 py-1 rounded-full bg-void-bg-2 text-void-fg-3">Enter an API key to verify</span>
+	}
+	else if (state === 'refreshing') {
+		content = (
+			<span className="flex items-center gap-1.5 text-xs px-2 py-1 rounded-full bg-void-bg-2 text-void-fg-3">
+				<Loader2 className="w-3 h-3 animate-spin" /> {isSlow ? 'Still verifying — this is taking longer than usual, check your network' : 'Verifying key...'}
+			</span>
+		)
+	}
+	else if (state === 'error') {
+		content = <span className="text-xs px-2 py-1 rounded-full bg-red-950 text-red-400">Key not valid</span>
+	}
+	else if (state === 'finished') {
+		content = (
+			<span className="flex items-center gap-1.5 text-xs px-2 py-1 rounded-full bg-emerald-950 text-emerald-500">
+				<Check className="w-3 h-3" /> Key verified
+			</span>
+		)
+	}
+	else {
+		content = <span className="text-xs px-2 py-1 rounded-full bg-void-bg-2 text-void-fg-3">Not yet verified</span>
+	}
+
+	const canClickVerify = isVerifiable && !!apiKey && !looksWrongFormat && state !== 'refreshing'
+
+	return <div className='flex items-center gap-3 mt-2'>
+		<span className='text-void-fg-3 text-xs'>API Key Status</span>
+		{content}
+		{isVerifiable && <button
+			type='button'
+			disabled={!canClickVerify}
+			onClick={() => {
+				refreshModelService.startRefreshingModels(providerName as RefreshableProviderName, { enableProviderOnSuccess: true, doNotFire: false })
+				metricsService.capture('Click', { providerName, action: 'Verify API Key' })
+			}}
+			className='text-xs px-2 py-1 rounded-full border border-void-border-2 text-void-fg-2 hover:bg-void-bg-2 disabled:opacity-40 disabled:cursor-default transition-colors'
+		>
+			Verify
+		</button>}
+	</div>
+}
+
+
 export const VoidProviderSettings = ({ providerNames }: { providerNames: ProviderName[] }) => {
 	return <>
-		{['microsoftAzure' as ProviderName].map(providerName =>
+		{providerNames.map(providerName =>
 			<SettingsForProvider key={providerName} providerName={providerName} showProviderTitle={true} showProviderSuggestions={true} />
 		)}
 	</>
@@ -1063,21 +1148,8 @@ const MCPServersList = () => {
 
 export const Settings = () => {
 	const isDark = useIsDark()
-	// ─── sidebar nav ──────────────────────────
-	const [selectedSection, setSelectedSection] =
-		useState<Tab>('models');
 	const [selectedModelProvider, setSelectedModelProvider] =
 		useState<ProviderName>('microsoftAzure');
-
-	const navItems: { tab: Tab; label: string }[] = [
-		{ tab: 'models', label: 'Models' },
-		{ tab: 'providers', label: 'Azure Configuration' },
-		// { tab: 'featureOptions', label: 'Feature Options' }, // hidden - not needed for this build
-		// { tab: 'general', label: 'General' }, // hidden - not needed for this build
-		// { tab: 'mcp', label: 'MCP' }, // hidden - not needed for this build
-		{ tab: 'all', label: 'All Settings' },
-	];
-	const shouldShowTab = (tab: Tab) => selectedSection === 'all' || selectedSection === tab;
 	const accessor = useAccessor()
 	const commandService = accessor.get('ICommandService')
 	const environmentService = accessor.get('IEnvironmentService')
@@ -1157,35 +1229,7 @@ export const Settings = () => {
 
 	return (
 		<div className={`@@void-scope ${isDark ? 'dark' : ''}`} style={{ height: '100%', width: '100%', overflow: 'auto' }}>
-			<div className="flex flex-col md:flex-row w-full gap-6 max-w-[900px] mx-auto mb-32" style={{ minHeight: '80vh' }}>
-				{/* ──────────────  SIDEBAR  ────────────── */}
-
-				<aside className="md:w-1/4 w-full p-6 shrink-0">
-					{/* vertical tab list */}
-					<div className="flex flex-col gap-2 mt-12">
-						{navItems.map(({ tab, label }) => (
-							<button
-								key={tab}
-								onClick={() => {
-									if (tab === 'all') {
-										setSelectedSection('all');
-										window.scrollTo({ top: 0, behavior: 'smooth' });
-									} else {
-										setSelectedSection(tab);
-									}
-								}}
-								className={`
-          py-2 px-4 rounded-md text-left transition-all duration-200
-          ${selectedSection === tab
-										? 'bg-black text-white dark:bg-white dark:text-black font-medium shadow-sm'
-										: 'bg-void-bg-2 hover:bg-void-bg-2/80 text-void-fg-1'}
-        `}
-							>
-								{label}
-							</button>
-						))}
-					</div>
-				</aside>
+			<div className="flex flex-col w-full max-w-[900px] mx-auto mb-32" style={{ minHeight: '80vh' }}>
 
 				{/* ───────────── MAIN PANE ───────────── */}
 				<main className="flex-1 p-6 select-none">
@@ -1207,46 +1251,52 @@ export const Settings = () => {
 
 						{/* All sections in flex container with gap-12 */}
 						<div className='flex flex-col gap-12'>
-							{/* Models section (formerly FeaturesTab) */}
-							<div className={shouldShowTab('models') ? `` : 'hidden'}>
+							{/* Models Configuration section - API keys + models, all in one place */}
+							<div>
 								<ErrorBoundary>
-									<h2 className={`text-3xl mb-2`}>Models</h2>
-
-									{/* provider picker - avoids dumping every provider's models on screen at once */}
-									<div className='flex items-center gap-2 mb-2'>
-										<span className='text-void-fg-3 text-sm'>Provider</span>
-										<ErrorBoundary>
-											<VoidCustomDropdownBox
-												options={providerNames}
-												selectedOption={selectedModelProvider}
-												onChangeOption={(pn) => setSelectedModelProvider(pn)}
-												getOptionDisplayName={(pn) => displayInfoOfProviderName(pn).title}
-												getOptionDropdownName={(pn) => displayInfoOfProviderName(pn).title}
-												getOptionsEqual={(a, b) => a === b}
-												className="max-w-48 w-full resize-none bg-void-bg-1 text-void-fg-1 border border-void-border-2 focus:border-void-border-1 py-1 px-2 rounded"
-												arrowTouchesText={false}
-											/>
-										</ErrorBoundary>
-									</div>
-
-									<ModelDump filteredProviders={[selectedModelProvider]} />
-									<div className='w-full h-[1px] my-4' />
-									<AutoDetectLocalModelsToggle />
-									<RefreshableModels />
-								</ErrorBoundary>
-							</div>
-
-							{/* Main Providers section */}
-							<div className={shouldShowTab('providers') ? `` : 'hidden'}>
-								<ErrorBoundary>
-									<h2 className={`text-3xl mb-2`}>Azure Configuration</h2>
-									<h3 className={`text-void-fg-3 mb-2`}>{`J code's uses Azure OpenAI for all AI features.`}</h3>
+									<h2 className={`text-3xl mb-1`}>Models Configuration</h2>
+									<h3 className={`text-void-fg-3 mb-4 text-sm`}>{`Add API keys and manage models for each provider.`}</h3>
 
 									<ErrorBoundary>
 										<ActiveModelIndicator />
 									</ErrorBoundary>
 
-									<VoidProviderSettings providerNames={['microsoftAzure']} />
+									<div className='rounded-lg border border-void-border-2 bg-void-bg-1/40 p-5'>
+										{/* provider picker - avoids dumping every provider's settings on screen at once */}
+										<div className='flex items-center gap-3 mb-5'>
+											<span className='text-void-fg-3 text-xs font-medium uppercase tracking-wide'>Provider</span>
+											<ErrorBoundary>
+												<VoidCustomDropdownBox
+													options={providerNames}
+													selectedOption={selectedModelProvider}
+													onChangeOption={(pn) => setSelectedModelProvider(pn)}
+													getOptionDisplayName={(pn) => displayInfoOfProviderName(pn).title}
+													getOptionDropdownName={(pn) => displayInfoOfProviderName(pn).title}
+													getOptionsEqual={(a, b) => a === b}
+													className="max-w-60 w-full resize-none bg-void-bg-1 text-void-fg-1 border border-void-border-2 focus:border-void-border-1 py-1.5 px-3 rounded-md"
+													arrowTouchesText={false}
+												/>
+											</ErrorBoundary>
+										</div>
+
+										<ErrorBoundary>
+											<SettingsForProvider providerName={selectedModelProvider} showProviderTitle={false} showProviderSuggestions={true} />
+										</ErrorBoundary>
+
+										<div className='w-full h-px bg-void-border-2 my-5' />
+
+										<div className='text-xs font-medium uppercase tracking-wide text-void-fg-3 mb-2'>Models</div>
+										<ErrorBoundary>
+											<ModelDump filteredProviders={[selectedModelProvider]} />
+										</ErrorBoundary>
+
+										<div className='w-full h-px bg-void-border-2 my-5' />
+
+										<ErrorBoundary>
+											<ApiKeyValidator providerName={selectedModelProvider} />
+										</ErrorBoundary>
+									</div>
+
 								</ErrorBoundary>
 							</div>
 
